@@ -1,6 +1,7 @@
 import express from "express";
 import { db } from "../db/client.js";
 import { authenticateToken } from "../middleware/authenticateToken.js";
+import { requireRank } from "./providers.js";
 
 export const activitiesRouter = express.Router();
 activitiesRouter.use(authenticateToken);
@@ -159,5 +160,47 @@ activitiesRouter.post("/", async (req, res) => {
   } catch (error) {
     console.error("Activity submit error:", error);
     return res.status(500).json({ error: "Unable to submit the activity." });
+  }
+});
+
+activitiesRouter.get("/pending", requireRank("moderator"), async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT ${activityColumns}
+       FROM activities
+       WHERE publication_status = 'PENDING_REVIEW'
+       ORDER BY created_at`,
+    );
+    return res.json({ activities: result.rows });
+  } catch (error) {
+    console.error("Pending activity list error:", error);
+    return res.status(500).json({ error: "Unable to load activities waiting for review." });
+  }
+});
+
+activitiesRouter.patch("/:id/review", requireRank("moderator"), async (req, res) => {
+  const status = String(req.body.publication_status || "").trim();
+  if (status !== "PUBLISHED" && status !== "REJECTED") {
+    return res.status(400).json({ error: "Status must be PUBLISHED or REJECTED." });
+  }
+
+  try {
+    const result = await db.query(
+      `UPDATE activities
+       SET publication_status = $1,
+           published_at = CASE WHEN $1 = 'PUBLISHED' THEN CURRENT_TIMESTAMP ELSE NULL END,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = $2
+         AND publication_status = 'PENDING_REVIEW'
+       RETURNING ${activityColumns}`,
+      [status, req.params.id],
+    );
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: "Activity waiting for review was not found." });
+    }
+    return res.json({ activity: result.rows[0] });
+  } catch (error) {
+    console.error("Activity review error:", error);
+    return res.status(500).json({ error: "Unable to review the activity." });
   }
 });

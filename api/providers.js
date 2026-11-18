@@ -151,24 +151,55 @@ providersRouter.post("/", async (req, res) => {
   }
 });
 
+const rankOf = {
+  parent: 0,
+  provider: 1,
+  moderator: 2,
+  admin: 3,
+  super_admin: 4,
+};
+
+export const loadRoles = async (userId) => {
+  const result = await db.query(
+    `SELECT role_code
+     FROM user_roles
+     WHERE user_id = $1
+       AND revoked_at IS NULL`,
+    [userId],
+  );
+  const roles = result.rows.map((row) => row.role_code);
+  const rank = roles.reduce((highest, role) => Math.max(highest, rankOf[role] ?? 0), 0);
+  return { roles, rank };
+};
+
+export const requireRank = (minimumRole) => async (req, res, next) => {
+  try {
+    const access = await loadRoles(req.user.id);
+    if (access.rank < rankOf[minimumRole]) {
+      return res.status(403).json({ error: "You do not have access to this task." });
+    }
+    req.access = access;
+    return next();
+  } catch (error) {
+    console.error("Role check error:", error);
+    return res.status(500).json({ error: "Unable to check access." });
+  }
+};
+
 providersRouter.get("/access", async (req, res) => {
   try {
-    const result = await db.query(
-      `SELECT 1
-       FROM user_roles
-       WHERE user_id = $1
-         AND role_code = 'admin'
-         AND revoked_at IS NULL`,
-      [req.user.id],
-    );
-    return res.json({ admin: result.rowCount > 0 });
+    const access = await loadRoles(req.user.id);
+    return res.json({
+      roles: access.roles,
+      workspace: access.rank >= rankOf.moderator,
+    });
   } catch (error) {
     console.error("Admin access check error:", error);
     return res.status(500).json({ error: "Unable to check admin access." });
   }
 });
 
-providersRouter.get("/pending", requireRole("admin"), async (req, res) => {
+providersRouter.get("/pending", requireRank("admin"), async (req, res) => {
   try {
     const result = await db.query(
       `SELECT
@@ -193,7 +224,7 @@ providersRouter.get("/pending", requireRole("admin"), async (req, res) => {
   }
 });
 
-providersRouter.patch("/:id/review", requireRole("admin"), async (req, res) => {
+providersRouter.patch("/:id/review", requireRank("admin"), async (req, res) => {
   const status = blankToNull(req.body.approval_status);
   if (status !== "APPROVED" && status !== "REJECTED") {
     return res.status(400).json({ error: "Status must be APPROVED or REJECTED." });
