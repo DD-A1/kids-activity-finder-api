@@ -5,6 +5,8 @@ import { db } from "./db/client.js";
 import { authorizationRouter } from "./api/authorization.js";
 import { childrenRouter } from "./api/children.js";
 import { householdRouter } from "./api/household.js";
+import { providersRouter } from "./api/providers.js";
+import { activitiesRouter } from "./api/activities.js";
 
 
 dotenv.config();
@@ -23,6 +25,8 @@ app.use(express.json());
 app.use("/api/auth", authorizationRouter);
 app.use("/api/children", childrenRouter);
 app.use("/api/household", householdRouter); 
+app.use("/api/providers", providersRouter);
+app.use("/api/activities", activitiesRouter);
 
 // Health check route
 app.get("/api/health", (req, res) => {
