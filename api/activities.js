@@ -6,6 +6,143 @@ import { requireRank } from "./providers.js";
 export const activitiesRouter = express.Router();
 activitiesRouter.use(authenticateToken);
 
+const establishedCategories = [
+  ["SPORTS", "Sports"],
+  ["EDUCATION", "Education"],
+  ["ARTS_AND_CRAFTS", "Arts and Crafts"],
+  ["MUSIC", "Music"],
+  ["RECREATION", "Recreation"],
+  ["READING_AND_LITERACY", "Reading and Literacy"],
+  ["STEM_AND_TECHNOLOGY", "STEM and Technology"],
+];
+
+const ensureCategories = async () => {
+  for (const [code, name] of establishedCategories) {
+    await db.query(
+      `INSERT INTO activity_categories (category_code, category_name, display_order)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (category_code) DO NOTHING`,
+      [code, name, establishedCategories.findIndex((item) => item[0] === code)],
+    );
+  }
+};
+
+activitiesRouter.get("/categories", async (req, res) => {
+  try {
+    await ensureCategories();
+    const result = await db.query(
+      `SELECT id, category_code, category_name
+       FROM activity_categories
+       WHERE is_active = TRUE
+       ORDER BY display_order, category_name`,
+    );
+    return res.json({ categories: result.rows });
+  } catch (error) {
+    console.error("Category list error:", error);
+    return res.status(500).json({ error: "Unable to load categories." });
+  }
+});
+
+activitiesRouter.get("/published", async (req, res) => {
+  const categoryId = req.query.category_id ? Number(req.query.category_id) : null;
+  if (req.query.category_id && (!Number.isInteger(categoryId) || categoryId <= 0)) {
+    return res.status(400).json({ error: "Choose a category." });
+  }
+
+  const ageMonths = req.query.age_months === undefined || req.query.age_months === ""
+    ? null
+    : Number(req.query.age_months);
+  if (ageMonths !== null && (!Number.isInteger(ageMonths) || ageMonths < 0)) {
+    return res.status(400).json({ error: "Age must be a whole number of months." });
+  }
+
+  const location = String(req.query.location || "").trim();
+
+  try {
+    const result = await db.query(
+      `SELECT ${activityColumns}
+       FROM activities
+       WHERE publication_status = 'PUBLISHED'
+         AND (
+           $1::bigint IS NULL
+           OR id IN (
+             SELECT activity_id
+             FROM activity_category_links
+             WHERE category_id = $1
+           )
+         )
+         AND (
+           $2::int IS NULL
+           OR (
+             (minimum_age_months IS NULL OR minimum_age_months <= $2)
+             AND (maximum_age_months IS NULL OR maximum_age_months >= $2)
+           )
+         )
+         AND (
+           $3 = ''
+           OR id IN (
+             SELECT activity_id
+             FROM activity_locations
+             WHERE location_notes ILIKE '%' || $3 || '%'
+                OR address_line_1 ILIKE '%' || $3 || '%'
+           )
+         )
+       ORDER BY published_at DESC NULLS LAST, created_at DESC`,
+      [categoryId, ageMonths, location],
+    );
+    return res.json({ activities: result.rows });
+  } catch (error) {
+    console.error("Published activity list error:", error);
+    return res.status(500).json({ error: "Unable to load published activities." });
+  }
+});
+
+activitiesRouter.get("/favorites", async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT a.id, a.title, a.is_free, a.price_amount
+       FROM activity_favorites f
+       JOIN activities a ON a.id = f.activity_id
+       WHERE f.user_id = $1
+       ORDER BY f.created_at DESC`,
+      [req.user.id],
+    );
+    return res.json({ favorites: result.rows });
+  } catch (error) {
+    console.error("Favorite list error:", error);
+    return res.status(500).json({ error: "Unable to load saved activities." });
+  }
+});
+
+activitiesRouter.post("/:id/favorite", async (req, res) => {
+  try {
+    await db.query(
+      `INSERT INTO activity_favorites (user_id, activity_id)
+       VALUES ($1, $2)
+       ON CONFLICT (user_id, activity_id) DO NOTHING`,
+      [req.user.id, req.params.id],
+    );
+    return res.status(201).json({ saved: true });
+  } catch (error) {
+    console.error("Save favorite error:", error);
+    return res.status(500).json({ error: "Unable to save this activity." });
+  }
+});
+
+activitiesRouter.delete("/:id/favorite", async (req, res) => {
+  try {
+    await db.query(
+      `DELETE FROM activity_favorites
+       WHERE user_id = $1 AND activity_id = $2`,
+      [req.user.id, req.params.id],
+    );
+    return res.json({ saved: false });
+  } catch (error) {
+    console.error("Remove favorite error:", error);
+    return res.status(500).json({ error: "Unable to remove this saved activity." });
+  }
+});
+
 const activityColumns = `
   id,
   provider_id,
@@ -38,6 +175,9 @@ const readActivity = (body) => {
     return { error: "Choose an approved provider." };
   }
   if (!title) return { error: "Title is required." };
+  if (!Number.isInteger(Number(body.category_id))) {
+    return { error: "Choose a category." };
+  }
   if (!["IN_PERSON", "ONLINE", "HYBRID"].includes(activityFormat)) {
     return { error: "Choose in person, online, or hybrid." };
   }
@@ -79,6 +219,7 @@ const readActivity = (body) => {
       isFree,
       priceAmount,
       registrationUrl: clean(body.registration_url),
+      categoryId: Number(body.category_id),
     },
   };
 };
@@ -156,10 +297,50 @@ activitiesRouter.post("/", async (req, res) => {
       ],
     );
 
+    await db.query(
+      `INSERT INTO activity_category_links (activity_id, category_id, is_primary)
+       VALUES ($1, $2, TRUE)`,
+      [result.rows[0].id, value.categoryId],
+    );
+
     return res.status(201).json({ activity: result.rows[0] });
   } catch (error) {
     console.error("Activity submit error:", error);
     return res.status(500).json({ error: "Unable to submit the activity." });
+  }
+});
+
+activitiesRouter.patch("/:id/category", async (req, res) => {
+  const categoryId = Number(req.body.category_id);
+  if (!Number.isInteger(categoryId) || categoryId <= 0) {
+    return res.status(400).json({ error: "Choose a category." });
+  }
+
+  try {
+    const owned = await db.query(
+      `SELECT 1
+       FROM activities a
+       JOIN provider_memberships m ON m.provider_id = a.provider_id
+       WHERE a.id = $1
+         AND m.user_id = $2
+         AND m.membership_role = 'OWNER'
+         AND m.membership_status = 'ACTIVE'`,
+      [req.params.id, req.user.id],
+    );
+    if (owned.rowCount === 0) {
+      return res.status(403).json({ error: "Only the provider owner can set the category." });
+    }
+
+    await db.query(`DELETE FROM activity_category_links WHERE activity_id = $1`, [req.params.id]);
+    await db.query(
+      `INSERT INTO activity_category_links (activity_id, category_id, is_primary)
+       VALUES ($1, $2, TRUE)`,
+      [req.params.id, categoryId],
+    );
+    return res.json({ category_id: categoryId });
+  } catch (error) {
+    console.error("Activity category error:", error);
+    return res.status(500).json({ error: "Unable to set the category." });
   }
 });
 
@@ -185,15 +366,15 @@ activitiesRouter.patch("/:id/review", requireRank("moderator"), async (req, res)
   }
 
   try {
+    const publishedAt = status === "PUBLISHED" ? new Date() : null;
     const result = await db.query(
       `UPDATE activities
-       SET publication_status = $1,
-           published_at = CASE WHEN $1 = 'PUBLISHED' THEN CURRENT_TIMESTAMP ELSE NULL END,
-           updated_at = CURRENT_TIMESTAMP
-       WHERE id = $2
+       SET publication_status = $1::varchar,
+           published_at = $2::timestamptz
+       WHERE id = $3::bigint
          AND publication_status = 'PENDING_REVIEW'
        RETURNING ${activityColumns}`,
-      [status, req.params.id],
+      [status, publishedAt, req.params.id],
     );
     if (result.rowCount === 0) {
       return res.status(404).json({ error: "Activity waiting for review was not found." });
@@ -201,6 +382,8 @@ activitiesRouter.patch("/:id/review", requireRank("moderator"), async (req, res)
     return res.json({ activity: result.rows[0] });
   } catch (error) {
     console.error("Activity review error:", error);
-    return res.status(500).json({ error: "Unable to review the activity." });
+    return res.status(500).json({
+      error: error.message || "Unable to review the activity.",
+    });
   }
 });
